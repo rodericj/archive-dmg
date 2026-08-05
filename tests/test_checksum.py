@@ -1,0 +1,48 @@
+"""Tests for archive_dmg.checksum."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+
+from archive_dmg import checksum
+
+
+def test_sha256_file_matches_hashlib(tmp_path):
+    file_path = tmp_path / "data.bin"
+    content = b"hello world" * 1000
+    file_path.write_bytes(content)
+
+    assert checksum.sha256_file(file_path) == hashlib.sha256(content).hexdigest()
+
+
+def test_sha256_file_reports_progress(tmp_path):
+    file_path = tmp_path / "data.bin"
+    content = b"x" * (5 * 1024 * 1024)
+    file_path.write_bytes(content)
+
+    read_sizes = []
+    checksum.sha256_file(file_path, on_bytes_read=read_sizes.append)
+
+    assert sum(read_sizes) == len(content)
+
+
+def test_sha256_hex_to_base64_round_trip():
+    digest = hashlib.sha256(b"abc").hexdigest()
+    expected = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    assert checksum.sha256_hex_to_base64(digest) == expected
+
+
+def test_format_sha256_line_matches_shasum_format():
+    assert checksum.format_sha256_line("abc123", "Card.dmg") == "abc123  Card.dmg\n"
+
+
+def test_write_sha256_file(tmp_path):
+    dmg_path = tmp_path / "Card.dmg"
+    dmg_path.write_bytes(b"data")
+    digest = checksum.sha256_file(dmg_path)
+
+    sha256_path = checksum.write_sha256_file(dmg_path, digest)
+
+    assert sha256_path == tmp_path / "Card.dmg.sha256"
+    assert sha256_path.read_text() == f"{digest}  Card.dmg\n"
