@@ -15,6 +15,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.progress import Progress, TaskID
+from rich.status import Status
 
 from archive_dmg import __version__
 from archive_dmg.archive_service import UploadReporter, upload_archive
@@ -24,7 +25,7 @@ from archive_dmg.doctor import run_aws_checks, run_environment_checks
 from archive_dmg.errors import ArchiveDmgError
 from archive_dmg.models import CheckResult, DmgVerificationResult, RemoteVerificationResult
 from archive_dmg.ui import (
-    create_upload_progress,
+    create_byte_progress,
     format_bytes,
     format_count,
     format_date_range,
@@ -111,14 +112,25 @@ class RichUploadReporter(UploadReporter):
         self._dmg_name = dmg_name
         self._progress: Progress | None = None
         self._task_id: TaskID | None = None
+        self._status: Status | None = None
 
     def environment_checked(self) -> None:
         print_section(self._console, "Checking environment")
         print_check(self._console, CheckResult(name="AWS credentials", status="ok"))
         print_check(self._console, CheckResult(name="Bucket reachable", status="ok"))
 
-    def verification_complete(self, result: DmgVerificationResult) -> None:
+    def verification_started(self) -> None:
         print_section(self._console, "Verifying image")
+        self._status = self._console.status(
+            "Running hdiutil verify and mounting (large images can take a while)..."
+        )
+        self._status.start()
+
+    def verification_complete(self, result: DmgVerificationResult) -> None:
+        if self._status is not None:
+            self._status.stop()
+            self._status = None
+
         print_check(self._console, CheckResult(name="DMG checksums verified", status="ok"))
         print_check(self._console, CheckResult(name="Mounted read-only", status="ok"))
 
@@ -131,13 +143,26 @@ class RichUploadReporter(UploadReporter):
         )
         self._console.print(f"Date range         {date_range}")
 
-    def checksum_ready(self, sha256_hex: str) -> None:
+    def checksum_started(self, total_bytes: int) -> None:
         print_section(self._console, "Calculating SHA-256")
+        self._progress = create_byte_progress(self._console)
+        self._progress.start()
+        self._task_id = self._progress.add_task("Hashing", total=total_bytes)
+
+    def checksum_progress(self, bytes_read: int) -> None:
+        if self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=bytes_read)
+
+    def checksum_ready(self, sha256_hex: str) -> None:
+        if self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
         print_check(self._console, CheckResult(name=sha256_hex, status="ok"))
 
     def upload_started(self, total_bytes: int) -> None:
         print_section(self._console, "Uploading")
-        self._progress = create_upload_progress(self._console)
+        self._progress = create_byte_progress(self._console)
         self._progress.start()
         self._task_id = self._progress.add_task(self._dmg_name, total=total_bytes)
 
@@ -149,6 +174,7 @@ class RichUploadReporter(UploadReporter):
         if self._progress is not None:
             self._progress.stop()
             self._progress = None
+            self._task_id = None
 
     def upload_sha256_complete(self) -> None:
         self._console.print("Checksum file                [green]✓[/green]")
@@ -223,7 +249,10 @@ def verify(
     try:
         path = validate_dmg_path(dmg_path)
         console.print(f"Verifying {path.name}")
-        result = verify_dmg(path)
+        with console.status(
+            "Running hdiutil verify and mounting (large images can take a while)..."
+        ):
+            result = verify_dmg(path)
     except ArchiveDmgError as exc:
         print_error(error_console, exc)
         raise typer.Exit(code=exc.exit_code) from None

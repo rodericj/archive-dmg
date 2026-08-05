@@ -59,7 +59,13 @@ class UploadReporter:
     def environment_checked(self) -> None:
         pass
 
+    def verification_started(self) -> None:
+        pass
+
     def verification_complete(self, result: DmgVerificationResult) -> None:
+        pass
+
+    def checksum_started(self, total_bytes: int) -> None:
         pass
 
     def checksum_progress(self, bytes_read: int) -> None:
@@ -127,13 +133,15 @@ def upload_archive(
             hint="Use --overwrite only if replacing it is intentional.",
         )
 
+    reporter.verification_started()
     verification = verify_dmg(dmg_path)
     reporter.verification_complete(verification)
 
+    archive_size_bytes = dmg_path.stat().st_size
+    reporter.checksum_started(archive_size_bytes)
     archive_sha256 = sha256_file(dmg_path, on_bytes_read=reporter.checksum_progress)
     reporter.checksum_ready(archive_sha256)
     sha256_path = write_sha256_file(dmg_path, archive_sha256)
-    archive_size_bytes = dmg_path.stat().st_size
 
     reporter.upload_started(archive_size_bytes)
     upload_file_with_progress(

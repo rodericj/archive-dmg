@@ -66,8 +66,8 @@ def print_success(console: Console, message: str) -> None:
     console.print(message, style="bold green")
 
 
-def create_upload_progress(console: Console) -> Progress:
-    """A determinate progress bar for the (potentially very large) DMG upload."""
+def create_byte_progress(console: Console) -> Progress:
+    """A determinate progress bar for a byte-counted operation (hashing or upload)."""
     return Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
