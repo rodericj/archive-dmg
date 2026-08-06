@@ -265,6 +265,7 @@ def test_verify_remote_object_direct_match():
     s3 = _client("s3")
     stubber = Stubber(s3)
     stubber.add_response("head_object", {"ContentLength": 100, "ChecksumSHA256": checksum_b64})
+    stubber.add_response("head_object", {})  # PartNumber=1 probe: no PartsCount => not multipart
     with stubber:
         result = aws.verify_remote_object(
             FakeSession(s3=s3),
@@ -282,9 +283,10 @@ def test_verify_remote_object_direct_match():
 def test_verify_remote_object_multipart_is_not_directly_comparable():
     s3 = _client("s3")
     stubber = Stubber(s3)
-    stubber.add_response(
-        "head_object", {"ContentLength": 100, "ChecksumSHA256": "composite==", "PartsCount": 3}
-    )
+    # A plain head_object never includes PartsCount, multipart or not -- only
+    # the PartNumber=1 probe does. The composite checksum is still present.
+    stubber.add_response("head_object", {"ContentLength": 100, "ChecksumSHA256": "composite=="})
+    stubber.add_response("head_object", {"PartsCount": 3})
     with stubber:
         result = aws.verify_remote_object(
             FakeSession(s3=s3),
@@ -303,6 +305,7 @@ def test_verify_remote_object_no_checksum_available():
     s3 = _client("s3")
     stubber = Stubber(s3)
     stubber.add_response("head_object", {"ContentLength": 100})
+    stubber.add_response("head_object", {})
     with stubber:
         result = aws.verify_remote_object(
             FakeSession(s3=s3),
@@ -336,6 +339,7 @@ def test_verify_remote_object_checksum_mismatch_raises():
     stubber = Stubber(s3)
     wrong_checksum = aws.sha256_hex_to_base64("11" * 32)
     stubber.add_response("head_object", {"ContentLength": 100, "ChecksumSHA256": wrong_checksum})
+    stubber.add_response("head_object", {})
     with stubber, pytest.raises(AwsUploadError):
         aws.verify_remote_object(
             FakeSession(s3=s3),
@@ -345,6 +349,22 @@ def test_verify_remote_object_checksum_mismatch_raises():
             local_size=100,
             local_sha256_hex="00" * 32,
         )
+
+
+def test_is_multipart_object_true_when_parts_count_greater_than_one():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response("head_object", {"PartsCount": 5})
+    with stubber:
+        assert aws._is_multipart_object(s3, "b", "k") is True
+
+
+def test_is_multipart_object_false_when_parts_count_absent():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response("head_object", {})
+    with stubber:
+        assert aws._is_multipart_object(s3, "b", "k") is False
 
 
 # --- create_session -------------------------------------------------------------

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -27,6 +28,9 @@ from botocore.exceptions import (
 from archive_dmg.checksum import sha256_hex_to_base64
 from archive_dmg.errors import AwsAuthError, AwsBucketError, AwsUploadError
 from archive_dmg.models import BucketDiagnostics, CallerIdentity, RemoteVerificationResult
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.client import S3Client
 
 _MULTIPART_THRESHOLD = 64 * 1024 * 1024
 _MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
@@ -330,6 +334,26 @@ def upload_bytes(
         raise AwsUploadError(message, hint=hint) from exc
 
 
+def _is_multipart_object(s3: S3Client, bucket: str, key: str) -> bool:
+    """Detect whether an object was uploaded via multipart.
+
+    S3 only ever includes ``PartsCount`` in a HeadObject response when the
+    request explicitly passes ``PartNumber`` -- a plain HeadObject omits it
+    for both single-part and multipart objects, so it cannot be used to tell
+    them apart. Note that when ``PartNumber`` is set, ``ContentLength``
+    reflects the size of that one part rather than the whole object, so this
+    helper is only used for the yes/no multipart check, never for size.
+    """
+    try:
+        response = s3.head_object(Bucket=bucket, Key=key, PartNumber=1)
+    except ClientError as exc:
+        raise AwsUploadError(
+            f"Could not determine multipart status for '{key}'.", hint=_error_message(exc)
+        ) from exc
+    parts_count = response.get("PartsCount")
+    return bool(parts_count and parts_count > 1)
+
+
 def verify_remote_object(
     session: boto3.Session,
     *,
@@ -363,10 +387,9 @@ def verify_remote_object(
             hint=f"Local size is {local_size} bytes; remote size is {remote_size} bytes.",
         )
 
-    parts_count = response.get("PartsCount")
     remote_checksum_b64 = response.get("ChecksumSHA256")
 
-    if parts_count and parts_count > 1:
+    if _is_multipart_object(s3, bucket, key):
         return RemoteVerificationResult(
             remote_size_verified=True,
             remote_checksum_verified=False,
