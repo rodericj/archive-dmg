@@ -127,3 +127,85 @@ def test_config_show_reflects_cli_overrides(tmp_path):
     assert result.exit_code == 0
     assert "override-bucket" in result.output
     assert "us-east-1" in result.output
+
+
+# --- list / download -----------------------------------------------------------
+
+
+def test_help_lists_new_read_commands():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "list" in result.output
+    assert "download" in result.output
+
+
+def test_download_help_documents_restore_workflow():
+    result = runner.invoke(app, ["download", "--help"])
+    assert result.exit_code == 0
+    assert "--restore" in result.output
+    assert "Glacier" in result.output
+
+
+def test_list_help_documents_prefix_and_all():
+    result = runner.invoke(app, ["list", "--help"])
+    assert result.exit_code == 0
+    assert "--prefix" in result.output
+    assert "--all" in result.output
+
+
+def test_list_without_bucket_reports_config_error(tmp_path):
+    result = runner.invoke(app, ["list", "--config", str(tmp_path / "absent.toml")])
+    assert result.exit_code == 1
+    assert "bucket" in result.output.lower()
+
+
+def test_download_without_bucket_reports_config_error(tmp_path):
+    result = runner.invoke(
+        app, ["download", "p/Card.dmg", "--config", str(tmp_path / "absent.toml")]
+    )
+    assert result.exit_code == 1
+    assert "bucket" in result.output.lower()
+
+
+def test_download_rejects_unknown_restore_tier_without_touching_aws(tmp_path):
+    """An invalid tier must fail locally, before any credential or network use."""
+    result = runner.invoke(
+        app,
+        [
+            "download",
+            "p/Card.dmg",
+            "--config",
+            str(tmp_path / "absent.toml"),
+            "--bucket",
+            "b",
+            "--region",
+            "us-west-2",
+            "--restore",
+            "--restore-tier",
+            "Speedy",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Speedy" in result.output
+    assert "Standard" in result.output
+
+
+def test_download_rejects_zero_restore_days_without_touching_aws(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "download",
+            "p/Card.dmg",
+            "--config",
+            str(tmp_path / "absent.toml"),
+            "--bucket",
+            "b",
+            "--region",
+            "us-west-2",
+            "--restore",
+            "--restore-days",
+            "0",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "at least 1" in result.output

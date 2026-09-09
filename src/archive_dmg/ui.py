@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from rich import box
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -18,11 +19,21 @@ from rich.progress import (
     TextColumn,
     TimeRemainingColumn,
 )
+from rich.table import Table
 
 from archive_dmg.errors import ArchiveDmgError
-from archive_dmg.models import CheckResult
+from archive_dmg.models import CheckResult, RemoteArchive
 
 _STATUS_GLYPHS = {"ok": ("✓", "green"), "warn": ("⚠", "yellow"), "fail": ("✗", "red")}
+
+#: How each ``RemoteArchive.restore_state`` reads in the ``list`` table, and in
+#: what style. Only archived objects can be in a state other than the first.
+_RESTORE_LABELS = {
+    "not_applicable": ("ready", "green"),
+    "not_restored": ("needs restore", "yellow"),
+    "in_progress": ("restoring...", "cyan"),
+    "restored": ("restored", "green"),
+}
 
 
 def _indent(text: str, spaces: int = 4) -> str:
@@ -109,3 +120,32 @@ def format_date_range(earliest: datetime | None, latest: datetime | None) -> str
 
 def format_entries(entries: tuple[str, ...]) -> str:
     return ", ".join(entries) if entries else "(none)"
+
+
+def format_restore_state(archive: RemoteArchive) -> tuple[str, str]:
+    """Return the (label, style) describing whether an archive can be read now."""
+    label, style = _RESTORE_LABELS.get(archive.restore_state, (archive.restore_state, "white"))
+    if archive.restore_state == "restored" and archive.restore_expiry_utc is not None:
+        label = f"{label} until {archive.restore_expiry_utc:%Y-%m-%d}"
+    return label, style
+
+
+def print_archive_table(console: Console, archives: tuple[RemoteArchive, ...]) -> None:
+    """Render the ``list`` output, newest first, with storage class and readiness."""
+    table = Table(box=box.SIMPLE, header_style="bold", expand=False)
+    table.add_column("Uploaded", no_wrap=True)
+    table.add_column("Size", justify="right", no_wrap=True)
+    table.add_column("Storage class", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Key", overflow="fold")
+
+    for archive in archives:
+        label, style = format_restore_state(archive)
+        table.add_row(
+            f"{archive.last_modified_utc:%Y-%m-%d}",
+            format_bytes(archive.size_bytes),
+            archive.storage_class,
+            f"[{style}]{label}[/{style}]",
+            archive.key,
+        )
+    console.print(table)

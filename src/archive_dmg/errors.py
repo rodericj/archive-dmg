@@ -54,5 +54,19 @@ class AwsUploadError(ArchiveDmgError):
     """An upload to S3 failed or could not be verified after completion."""
 
 
+class AwsDownloadError(ArchiveDmgError):
+    """A download from S3 failed, or the downloaded file could not be verified."""
+
+
+class ArchiveNotRestoredError(ArchiveDmgError):
+    """The object is in Glacier storage and has no temporary restored copy yet.
+
+    Glacier and Deep Archive objects cannot be read directly -- a restore must
+    be requested first, and it completes hours later. This is a distinct error
+    from a generic download failure because the remedy is specific: run
+    ``download --restore``, wait, then download again.
+    """
+
+
 class DestinationExistsError(ArchiveDmgError):
     """The destination object already exists and ``--overwrite`` was not given."""

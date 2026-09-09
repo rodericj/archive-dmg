@@ -18,19 +18,35 @@ from rich.progress import Progress, TaskID
 from rich.status import Status
 
 from archive_dmg import __version__
-from archive_dmg.archive_service import UploadReporter, upload_archive
+from archive_dmg.archive_service import (
+    DownloadReporter,
+    UploadReporter,
+    download_archive,
+    list_remote_archives,
+    request_restore,
+    upload_archive,
+)
 from archive_dmg.config import DEFAULT_CONFIG_PATH, resolve_config, write_example_config
 from archive_dmg.dmg import validate_dmg_path, verify_dmg
 from archive_dmg.doctor import run_aws_checks, run_environment_checks
 from archive_dmg.errors import ArchiveDmgError
-from archive_dmg.models import CheckResult, DmgVerificationResult, RemoteVerificationResult
+from archive_dmg.models import (
+    CheckResult,
+    DmgVerificationResult,
+    DownloadVerification,
+    RemoteArchive,
+    RemoteVerificationResult,
+    RestoreRequestResult,
+)
 from archive_dmg.ui import (
     create_byte_progress,
     format_bytes,
     format_count,
     format_date_range,
     format_entries,
+    format_restore_state,
     format_timestamp,
+    print_archive_table,
     print_check,
     print_error,
     print_key_value,
@@ -199,6 +215,86 @@ class RichUploadReporter(UploadReporter):
             )
 
 
+class RichDownloadReporter(DownloadReporter):
+    """Drives the Rich output for `download`, matching each pipeline stage."""
+
+    def __init__(self, rich_console: Console) -> None:
+        self._console = rich_console
+        self._progress: Progress | None = None
+        self._task_id: TaskID | None = None
+
+    def environment_checked(self) -> None:
+        print_section(self._console, "Checking environment")
+        print_check(self._console, CheckResult(name="AWS credentials", status="ok"))
+        print_check(self._console, CheckResult(name="Bucket reachable", status="ok"))
+
+    def archive_resolved(self, archive: RemoteArchive) -> None:
+        label, _ = format_restore_state(archive)
+        print_section(self._console, "Object")
+        self._console.print(f"Key            {archive.key}")
+        self._console.print(f"Size           {format_bytes(archive.size_bytes)}")
+        self._console.print(f"Storage class  {archive.storage_class}")
+        self._console.print(f"Status         {label}")
+
+    def _stop(self) -> None:
+        if self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._task_id = None
+
+    def download_started(self, total_bytes: int) -> None:
+        print_section(self._console, "Downloading")
+        self._progress = create_byte_progress(self._console)
+        self._progress.start()
+        self._task_id = self._progress.add_task("Downloading", total=total_bytes)
+
+    def download_progress(self, bytes_transferred: int) -> None:
+        if self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=bytes_transferred)
+
+    def download_complete(self, path: Path) -> None:
+        self._stop()
+
+    def checksum_started(self, total_bytes: int) -> None:
+        print_section(self._console, "Verifying SHA-256")
+        self._progress = create_byte_progress(self._console)
+        self._progress.start()
+        self._task_id = self._progress.add_task("Hashing", total=total_bytes)
+
+    def checksum_progress(self, bytes_read: int) -> None:
+        if self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=bytes_read)
+
+    def verification_complete(self, result: DownloadVerification) -> None:
+        self._stop()
+        if result.status == "verified":
+            print_check(
+                self._console,
+                CheckResult(name="Checksum matches the .sha256 stored in S3", status="ok"),
+            )
+        elif result.status == "sidecar_missing":
+            print_check(
+                self._console,
+                CheckResult(
+                    name="Checksum not verified",
+                    status="warn",
+                    detail=(
+                        "This object has no .sha256 companion in S3, so there was nothing "
+                        "to compare against. Size was confirmed against S3's own metadata."
+                    ),
+                ),
+            )
+        else:
+            print_check(
+                self._console,
+                CheckResult(
+                    name="Checksum verification skipped",
+                    status="warn",
+                    detail="Re-run without --no-verify to confirm the download is intact.",
+                ),
+            )
+
+
 @app.command()
 def doctor(
     config_path: ConfigPathOption = DEFAULT_CONFIG_PATH,
@@ -324,6 +420,178 @@ def upload(
         "Scheduled to transition to Glacier Deep Archive per the bucket's lifecycle rule "
         "(run 'archive-dmg doctor' to confirm one is configured).",
     )
+
+
+@app.command("list")
+def list_command(
+    config_path: ConfigPathOption = DEFAULT_CONFIG_PATH,
+    bucket: BucketOption = None,
+    region: RegionOption = None,
+    prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--prefix",
+            help="Key prefix to list. Defaults to the config file's prefix; pass '' for the "
+            "whole bucket.",
+        ),
+    ] = None,
+    profile: ProfileOption = None,
+    all_keys: Annotated[
+        bool,
+        typer.Option(
+            "--all", help="Include the .sha256 and .manifest.json companions, not just archives."
+        ),
+    ] = False,
+) -> None:
+    """List archives in the bucket, newest first, with storage class and restore status."""
+    try:
+        cfg = resolve_config(
+            config_path=config_path,
+            cli_bucket=bucket,
+            cli_region=region,
+            cli_prefix=prefix,
+            cli_profile=profile,
+        )
+        archives = list_remote_archives(config=cfg, prefix=prefix, all_keys=all_keys)
+    except ArchiveDmgError as exc:
+        print_error(error_console, exc)
+        raise typer.Exit(code=exc.exit_code) from None
+
+    if not archives:
+        where = f"s3://{cfg.bucket}/{cfg.default_prefix}" if cfg.default_prefix else cfg.bucket
+        console.print(f"No archives found under {where}.")
+        return
+
+    console.print()
+    print_archive_table(console, archives)
+    total = sum(archive.size_bytes for archive in archives)
+    console.print(
+        f"{format_count(len(archives))} object(s), {format_bytes(total)} total.", style="dim"
+    )
+    if any(a.is_archived and a.restore_state == "not_restored" for a in archives):
+        console.print()
+        console.print(
+            "Objects marked 'needs restore' are in Glacier storage and cannot be downloaded "
+            "until a temporary copy is requested with 'archive-dmg download <key> --restore'.",
+            style="dim",
+        )
+
+
+@app.command()
+def download(
+    key: Annotated[str, typer.Argument(help="S3 key of the archive to download.")],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Destination file, or an existing directory to download into.",
+        ),
+    ] = Path(),
+    config_path: ConfigPathOption = DEFAULT_CONFIG_PATH,
+    bucket: BucketOption = None,
+    region: RegionOption = None,
+    profile: ProfileOption = None,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Allow replacing an existing local file.")
+    ] = False,
+    restore: Annotated[
+        bool,
+        typer.Option(
+            "--restore",
+            help="Request a temporary readable copy of a Glacier object instead of downloading.",
+        ),
+    ] = False,
+    restore_days: Annotated[
+        int, typer.Option("--restore-days", help="How many days the restored copy should last.")
+    ] = 7,
+    restore_tier: Annotated[
+        str,
+        typer.Option(
+            "--restore-tier",
+            help="Retrieval tier: Standard (~12h) or Bulk (~48h, cheaper).",
+        ),
+    ] = "Standard",
+    no_verify: Annotated[
+        bool,
+        typer.Option("--no-verify", help="Skip comparing the download to its .sha256 companion."),
+    ] = False,
+) -> None:
+    """Download an archive from S3 and verify it against the checksum stored beside it."""
+    try:
+        cfg = resolve_config(
+            config_path=config_path,
+            cli_bucket=bucket,
+            cli_region=region,
+            cli_profile=profile,
+        )
+        if restore:
+            outcome = request_restore(
+                key=key, config=cfg, days=restore_days, tier=restore_tier
+            )
+            _print_restore_outcome(outcome)
+            return
+
+        reporter = RichDownloadReporter(console)
+        result = download_archive(
+            key=key,
+            config=cfg,
+            destination=output,
+            overwrite=overwrite,
+            verify_checksum=not no_verify,
+            reporter=reporter,
+        )
+    except ArchiveDmgError as exc:
+        print_error(error_console, exc)
+        raise typer.Exit(code=exc.exit_code) from None
+    except KeyboardInterrupt:
+        error_console.print()
+        error_console.print("Interrupted.", style="bold yellow")
+        raise typer.Exit(code=130) from None
+
+    print_success(console, "Success")
+    print_key_value(console, "Saved to", str(result.path))
+    print_key_value(console, "Size", format_bytes(result.archive.size_bytes))
+    if result.verification.local_sha256:
+        print_key_value(console, "SHA-256", result.verification.local_sha256)
+    if result.sha256_path is not None:
+        print_key_value(
+            console,
+            "Checksum file",
+            f"{result.sha256_path}\n\nVerify again at any time with:\n\n"
+            f"    shasum -a 256 -c '{result.sha256_path.name}'",
+        )
+
+
+def _print_restore_outcome(outcome: RestoreRequestResult) -> None:
+    """Render the result of a --restore request, including how long to expect to wait."""
+    archive = outcome.archive
+    if outcome.outcome == "already_restored":
+        print_success(console, "Already readable -- no restore needed.")
+        print_key_value(console, "Object", archive.uri)
+        print_key_value(console, "Storage class", archive.storage_class)
+        console.print()
+        console.print("Download it now with:", style="dim")
+        console.print(f"    archive-dmg download '{archive.key}'")
+        return
+
+    if outcome.outcome == "already_in_progress":
+        print_success(console, "A restore was already in progress.")
+    else:
+        print_success(console, "Restore requested.")
+
+    print_key_value(console, "Object", archive.uri)
+    print_key_value(console, "Storage class", archive.storage_class)
+    print_key_value(console, "Readable for", f"{outcome.days} day(s) once restored")
+    print_key_value(
+        console,
+        "Expected wait",
+        "Around 12 hours at Standard tier, up to 48 at Bulk. AWS does not report a "
+        "precise completion time.",
+    )
+    console.print()
+    console.print("Check progress with:", style="dim")
+    console.print("    archive-dmg list")
 
 
 @config_app.command("init")

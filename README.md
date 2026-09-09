@@ -14,6 +14,10 @@ transitions them to Glacier Deep Archive for long-term, low-cost storage.
 - Uploads the DMG, checksum file, and manifest to S3 with a progress bar,
   automatic multipart transfer for large files, and post-upload verification
   of the remote object.
+- Lists what is already archived, showing each object's storage class and
+  whether it can be read right now or needs a Glacier restore first.
+- Downloads an archive back, requesting the Deep Archive restore when needed
+  and verifying the result against the `.sha256` stored beside it in S3.
 - Runs a `doctor` command that checks your local environment and AWS setup
   before you try to upload anything.
 
@@ -335,9 +339,60 @@ Once uploaded, an object begins in S3 Standard. The bucket's lifecycle rule
   request time, not from this tool.
 - A restored copy is temporary and expires after the number of days you
   requested; the object remains in Deep Archive as the permanent copy.
-- `archive-dmg restore` (a temporary-copy request) and `archive-dmg list`
-  (browsing existing archives) are on the roadmap but not implemented yet --
-  use the AWS CLI or console for now.
+- `archive-dmg list` shows each object's storage class and whether it is
+  readable right now, and `archive-dmg download --restore` requests the
+  temporary copy, so neither step needs the AWS CLI.
+
+## `list`
+
+Browse what is already archived, newest first:
+
+```sh
+archive-dmg list
+archive-dmg list --prefix ''          # the whole bucket
+archive-dmg list --all                # include .sha256/.manifest.json companions
+```
+
+The `Status` column answers the only question that matters before a download:
+whether the object can be read right now. `ready` means a directly readable
+storage class, `needs restore` means Glacier storage with no temporary copy,
+`restoring...` means AWS is working on one, and `restored until <date>` means
+a temporary copy exists and when it expires.
+
+Restore state comes back in the same `ListObjectsV2` call via
+`OptionalObjectAttributes`, so listing costs one request per page rather than
+a `HeadObject` per object.
+
+## `download`
+
+```sh
+archive-dmg download 'dji-session/DJIMiniPro4First3Years.dmg' -o ~/Downloads
+```
+
+The download is verified, not just transferred. After the bytes land,
+`download` compares the local file's size against S3's metadata, then fetches
+the `<key>.sha256` companion, hashes the local file, and compares the two. A
+mismatch is an error, not a warning. On success it writes the `.sha256` file
+next to the download so the check can be repeated later with `shasum`.
+
+If the object is in Glacier storage with no restored copy, `download` refuses
+to start rather than failing partway, and points at the restore step:
+
+```sh
+archive-dmg download 'dji-session/DJIMiniPro4First3Years.dmg' --restore
+archive-dmg download 'dji-session/DJIMiniPro4First3Years.dmg' --restore --restore-tier Bulk
+```
+
+`--restore` requests the temporary copy and exits; it does not wait, because
+Deep Archive retrieval takes hours (roughly 12 at `Standard`, up to 48 at
+`Bulk`, which is cheaper). Check progress with `archive-dmg list`, then run
+`download` again without `--restore`. Requesting a restore for an object that
+is already readable is reported as such instead of issuing a pointless
+request.
+
+Other options: `--overwrite` to replace an existing local file, `--no-verify`
+to skip the checksum comparison, and `--restore-days` to control how long the
+temporary copy lasts (default 7).
 
 ## Security notes
 
@@ -371,17 +426,19 @@ mocking `subprocess.run`.
 
 - Only already-created `.dmg` files can be archived; there is no SD-card
   imaging yet (`archive-dmg create` is planned -- see Roadmap).
-- `restore` and `list` are not implemented; use the AWS CLI/console.
 - Only S3-managed (SSE-S3) default bucket encryption is checked by `doctor`;
   SSE-KMS buckets are treated as encrypted but key policy is not inspected.
 - `doctor --fix` (automatic remediation) is not implemented by design for
   this first version.
+- `list` reads storage class and restore state straight from S3 rather than
+  from the uploaded `.manifest.json` files, so it does not yet surface file
+  counts or capture date ranges in the listing.
 
 ## Roadmap
 
 - `archive-dmg create`: build a DMG from an SD card or mounted volume, then
   call the same verification/checksum/manifest/upload pipeline `upload`
   already uses.
-- `archive-dmg restore`: request a temporary restore from Deep Archive.
-- `archive-dmg list`: browse archives already in S3 using the manifest
-  files as an index.
+- Use the `.manifest.json` companions as a richer index for `list`, so the
+  listing can show file counts and capture date ranges without downloading
+  the archive.

@@ -12,7 +12,7 @@ from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from botocore.stub import Stubber
 
 from archive_dmg import aws
-from archive_dmg.errors import AwsAuthError, AwsBucketError, AwsUploadError
+from archive_dmg.errors import AwsAuthError, AwsBucketError, AwsDownloadError, AwsUploadError
 
 
 class FakeSession:
@@ -373,3 +373,208 @@ def test_is_multipart_object_false_when_parts_count_absent():
 def test_create_session_unknown_profile_raises():
     with pytest.raises(AwsAuthError):
         aws.create_session(profile="archive-dmg-test-profile-does-not-exist", region="us-west-2")
+
+
+# --- _parse_restore_state ------------------------------------------------------
+
+
+def test_parse_restore_state_not_applicable_for_standard():
+    assert aws._parse_restore_state("STANDARD", None) == ("not_applicable", None)
+
+
+def test_parse_restore_state_archived_with_no_header_is_not_restored():
+    assert aws._parse_restore_state("DEEP_ARCHIVE", None) == ("not_restored", None)
+
+
+def test_parse_restore_state_detects_in_progress():
+    state, expiry = aws._parse_restore_state("DEEP_ARCHIVE", 'ongoing-request="true"')
+    assert state == "in_progress"
+    assert expiry is None
+
+
+def test_parse_restore_state_detects_restored_with_expiry():
+    header = 'ongoing-request="false", expiry-date="Fri, 21 Dec 2012 00:00:00 GMT"'
+    state, expiry = aws._parse_restore_state("DEEP_ARCHIVE", header)
+    assert state == "restored"
+    assert expiry is not None
+    assert (expiry.year, expiry.month, expiry.day) == (2012, 12, 21)
+
+
+def test_parse_restore_state_restored_tolerates_unparseable_expiry():
+    header = 'ongoing-request="false", expiry-date="not a date"'
+    assert aws._parse_restore_state("DEEP_ARCHIVE", header) == ("restored", None)
+
+
+# --- list_archives -------------------------------------------------------------
+
+
+def _dt(day: int):
+    from datetime import UTC, datetime
+
+    return datetime(2026, 1, day, tzinfo=UTC)
+
+
+def test_list_archives_filters_to_dmg_and_sorts_newest_first():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response(
+        "list_objects_v2",
+        {
+            "Contents": [
+                {"Key": "p/old.dmg", "Size": 10, "LastModified": _dt(1)},
+                {"Key": "p/new.dmg", "Size": 20, "LastModified": _dt(9)},
+                {"Key": "p/new.dmg.sha256", "Size": 8, "LastModified": _dt(9)},
+            ]
+        },
+        {"Bucket": "b", "Prefix": "p", "OptionalObjectAttributes": ["RestoreStatus"]},
+    )
+    with stubber:
+        out = aws.list_archives(FakeSession(s3=s3), bucket="b", region="us-west-2", prefix="p")
+    assert [a.key for a in out] == ["p/new.dmg", "p/old.dmg"]
+
+
+def test_list_archives_all_keys_includes_companions():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response(
+        "list_objects_v2",
+        {
+            "Contents": [
+                {"Key": "p/a.dmg", "Size": 10, "LastModified": _dt(1)},
+                {"Key": "p/a.dmg.sha256", "Size": 8, "LastModified": _dt(1)},
+            ]
+        },
+        {"Bucket": "b", "Prefix": "p", "OptionalObjectAttributes": ["RestoreStatus"]},
+    )
+    with stubber:
+        out = aws.list_archives(
+            FakeSession(s3=s3), bucket="b", region="us-west-2", prefix="p", suffix=None
+        )
+    assert len(out) == 2
+
+
+def test_list_archives_maps_restore_status_from_list_response():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response(
+        "list_objects_v2",
+        {
+            "Contents": [
+                {
+                    "Key": "p/pending.dmg",
+                    "Size": 1,
+                    "LastModified": _dt(3),
+                    "StorageClass": "DEEP_ARCHIVE",
+                    "RestoreStatus": {"IsRestoreInProgress": True},
+                },
+                {
+                    "Key": "p/cold.dmg",
+                    "Size": 1,
+                    "LastModified": _dt(2),
+                    "StorageClass": "DEEP_ARCHIVE",
+                },
+                {
+                    "Key": "p/warm.dmg",
+                    "Size": 1,
+                    "LastModified": _dt(1),
+                    "StorageClass": "DEEP_ARCHIVE",
+                    "RestoreStatus": {"IsRestoreInProgress": False, "RestoreExpiryDate": _dt(20)},
+                },
+            ]
+        },
+        {"Bucket": "b", "Prefix": "p", "OptionalObjectAttributes": ["RestoreStatus"]},
+    )
+    with stubber:
+        out = aws.list_archives(FakeSession(s3=s3), bucket="b", region="us-west-2", prefix="p")
+    states = {a.key: a.restore_state for a in out}
+    assert states == {
+        "p/pending.dmg": "in_progress",
+        "p/cold.dmg": "not_restored",
+        "p/warm.dmg": "restored",
+    }
+    assert all(a.is_archived for a in out)
+    assert [a.is_downloadable for a in out if a.key == "p/warm.dmg"] == [True]
+    assert [a.is_downloadable for a in out if a.key == "p/cold.dmg"] == [False]
+
+
+def test_list_archives_access_denied_is_bucket_error():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_client_error("list_objects_v2", service_error_code="AccessDenied")
+    with stubber, pytest.raises(AwsBucketError) as exc_info:
+        aws.list_archives(FakeSession(s3=s3), bucket="b", region="us-west-2")
+    assert "ListBucket" in exc_info.value.hint
+
+
+# --- head_archive --------------------------------------------------------------
+
+
+def test_head_archive_defaults_absent_storage_class_to_standard():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response(
+        "head_object",
+        {"ContentLength": 42, "LastModified": _dt(4)},
+        {"Bucket": "b", "Key": "k.dmg"},
+    )
+    with stubber:
+        archive = aws.head_archive(FakeSession(s3=s3), bucket="b", key="k.dmg", region="us-west-2")
+    assert archive.storage_class == "STANDARD"
+    assert archive.is_downloadable is True
+    assert archive.size_bytes == 42
+
+
+def test_head_archive_missing_object_raises_download_error():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_client_error("head_object", service_error_code="404", http_status_code=404)
+    with stubber, pytest.raises(AwsDownloadError) as exc_info:
+        aws.head_archive(FakeSession(s3=s3), bucket="b", key="nope.dmg", region="us-west-2")
+    assert "list" in exc_info.value.hint
+
+
+# --- restore_archive -----------------------------------------------------------
+
+
+def test_restore_archive_requests_and_reports_requested():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_response(
+        "restore_object",
+        {},
+        {
+            "Bucket": "b",
+            "Key": "k.dmg",
+            "RestoreRequest": {"Days": 7, "GlacierJobParameters": {"Tier": "Standard"}},
+        },
+    )
+    with stubber:
+        outcome = aws.restore_archive(
+            FakeSession(s3=s3), bucket="b", key="k.dmg", region="us-west-2", days=7, tier="Standard"
+        )
+    assert outcome == "requested"
+
+
+def test_restore_archive_already_in_progress_is_not_an_error():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_client_error("restore_object", service_error_code="RestoreAlreadyInProgress")
+    with stubber:
+        outcome = aws.restore_archive(
+            FakeSession(s3=s3), bucket="b", key="k.dmg", region="us-west-2", days=7, tier="Bulk"
+        )
+    assert outcome == "already_in_progress"
+
+
+# --- download_bytes ------------------------------------------------------------
+
+
+def test_download_bytes_returns_none_when_sidecar_absent():
+    s3 = _client("s3")
+    stubber = Stubber(s3)
+    stubber.add_client_error("get_object", service_error_code="NoSuchKey", http_status_code=404)
+    with stubber:
+        assert (
+            aws.download_bytes(FakeSession(s3=s3), bucket="b", key="k.sha256", region="us-west-2")
+            is None
+        )

@@ -10,9 +10,13 @@ botocore provides rather than swallowed.
 
 from __future__ import annotations
 
+import contextlib
+import re
 from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -26,11 +30,27 @@ from botocore.exceptions import (
 )
 
 from archive_dmg.checksum import sha256_hex_to_base64
-from archive_dmg.errors import AwsAuthError, AwsBucketError, AwsUploadError
-from archive_dmg.models import BucketDiagnostics, CallerIdentity, RemoteVerificationResult
+from archive_dmg.errors import (
+    AwsAuthError,
+    AwsBucketError,
+    AwsDownloadError,
+    AwsUploadError,
+)
+from archive_dmg.models import (
+    ARCHIVED_STORAGE_CLASSES,
+    BucketDiagnostics,
+    CallerIdentity,
+    RemoteArchive,
+    RemoteVerificationResult,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_s3.literals import TierType
+
+#: Retrieval tiers S3 accepts. ``Expedited`` is valid for Glacier Flexible
+#: Retrieval but rejected for Deep Archive, which offers only the other two.
+RESTORE_TIERS: tuple[str, ...] = ("Standard", "Bulk", "Expedited")
 
 _MULTIPART_THRESHOLD = 64 * 1024 * 1024
 _MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
@@ -100,6 +120,58 @@ def _upload_failure(exc: ClientError) -> tuple[str, str]:
             "Check the bucket name in your config file or --bucket argument.",
         )
     return (f"Upload failed ({code or 'unknown error'}).", _error_message(exc))
+
+
+def _download_failure(exc: ClientError) -> tuple[str, str]:
+    code = _error_code(exc)
+    if code in ("ExpiredToken", "ExpiredTokenException", "RequestExpired"):
+        return (
+            "Download failed because AWS credentials expired.",
+            "Refresh the active profile or run:\n\n    aws configure",
+        )
+    if code == "AccessDenied":
+        return (
+            "AWS denied permission to download from this bucket.",
+            "Verify the active AWS identity has s3:GetObject permission on the object.",
+        )
+    if code in ("NoSuchKey", "404"):
+        return (
+            "The object does not exist in this bucket.",
+            "Run 'archive-dmg list' to see the available archives.",
+        )
+    if code == "InvalidObjectState":
+        return (
+            "This object is in Glacier storage and has no restored copy to read.",
+            "Request one first:\n\n    archive-dmg download <key> --restore",
+        )
+    return (f"Download failed ({code or 'unknown error'}).", _error_message(exc))
+
+
+_RESTORE_EXPIRY = re.compile(r'expiry-date="([^"]+)"')
+
+
+def _parse_restore_state(
+    storage_class: str, restore_header: str | None
+) -> tuple[str, datetime | None]:
+    """Interpret the ``x-amz-restore`` header into a ``RemoteArchive.restore_state``.
+
+    The header is absent entirely until a restore is requested, reads
+    ``ongoing-request="true"`` while AWS is working, and then carries both
+    ``ongoing-request="false"`` and an ``expiry-date`` once a temporary copy
+    exists.
+    """
+    if storage_class not in ARCHIVED_STORAGE_CLASSES:
+        return "not_applicable", None
+    if not restore_header:
+        return "not_restored", None
+    if 'ongoing-request="true"' in restore_header:
+        return "in_progress", None
+    expiry: datetime | None = None
+    match = _RESTORE_EXPIRY.search(restore_header)
+    if match:
+        with contextlib.suppress(ValueError, TypeError):
+            expiry = parsedate_to_datetime(match.group(1)).astimezone(UTC)
+    return "restored", expiry
 
 
 def get_caller_identity(session: boto3.Session) -> CallerIdentity:
@@ -414,3 +486,201 @@ def verify_remote_object(
         "Uploaded object checksum does not match the local file.",
         hint="The upload may be corrupted. Investigate, then retry with --overwrite.",
     )
+
+
+def list_archives(
+    session: boto3.Session,
+    *,
+    bucket: str,
+    region: str,
+    prefix: str = "",
+    suffix: str | None = ".dmg",
+) -> tuple[RemoteArchive, ...]:
+    """List archived objects under ``prefix``, newest first.
+
+    ``suffix`` filters to the archives themselves (``.dmg``) so the ``.sha256``
+    and ``.manifest.json`` companions do not clutter the listing; pass ``None``
+    to list every key. Restore status comes back in the same call via
+    ``OptionalObjectAttributes``, which avoids a HeadObject per object.
+    """
+    s3 = session.client("s3", region_name=region)
+    paginator = s3.get_paginator("list_objects_v2")
+    archives: list[RemoteArchive] = []
+    try:
+        pages = paginator.paginate(
+            Bucket=bucket,
+            Prefix=prefix,
+            OptionalObjectAttributes=["RestoreStatus"],
+        )
+        for page in pages:
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if suffix is not None and not key.lower().endswith(suffix):
+                    continue
+                storage_class = obj.get("StorageClass") or "STANDARD"
+                status = obj.get("RestoreStatus") or {}
+                if storage_class not in ARCHIVED_STORAGE_CLASSES:
+                    state, expiry = "not_applicable", None
+                elif status.get("IsRestoreInProgress"):
+                    state, expiry = "in_progress", None
+                elif status.get("RestoreExpiryDate"):
+                    state, expiry = "restored", status["RestoreExpiryDate"]
+                else:
+                    state, expiry = "not_restored", None
+                archives.append(
+                    RemoteArchive(
+                        bucket=bucket,
+                        key=key,
+                        region=region,
+                        size_bytes=obj.get("Size", 0),
+                        last_modified_utc=obj["LastModified"],
+                        storage_class=storage_class,
+                        restore_state=state,
+                        restore_expiry_utc=expiry,
+                    )
+                )
+    except ClientError as exc:
+        code = _error_code(exc)
+        if code in ("NoSuchBucket", "404"):
+            raise AwsBucketError(
+                f"Bucket not found:\n\n    {bucket}",
+                hint="Check the bucket name in your config file or --bucket argument.",
+            ) from exc
+        if code == "AccessDenied":
+            raise AwsBucketError(
+                f"AWS denied permission to list objects in '{bucket}'.",
+                hint="Verify the active AWS identity has s3:ListBucket permission.",
+            ) from exc
+        raise AwsBucketError(
+            f"Could not list objects in '{bucket}'.", hint=_error_message(exc)
+        ) from exc
+    except EndpointConnectionError as exc:
+        raise AwsBucketError(
+            "Could not reach AWS.", hint="Check your network connection and try again."
+        ) from exc
+
+    archives.sort(key=lambda a: a.last_modified_utc, reverse=True)
+    return tuple(archives)
+
+
+def head_archive(
+    session: boto3.Session, *, bucket: str, key: str, region: str
+) -> RemoteArchive:
+    """Fetch one object's size, storage class, and restore state.
+
+    HeadObject omits ``StorageClass`` for objects in S3 Standard, so an absent
+    value is treated as ``STANDARD`` rather than unknown.
+    """
+    s3 = session.client("s3", region_name=region)
+    try:
+        response = s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status == 404 or _error_code(exc) in ("404", "NoSuchKey"):
+            raise AwsDownloadError(
+                f"No such object:\n\n    s3://{bucket}/{key}",
+                hint="Run 'archive-dmg list' to see the available archives.",
+            ) from exc
+        message, hint = _download_failure(exc)
+        raise AwsDownloadError(message, hint=hint) from exc
+    except EndpointConnectionError as exc:
+        raise AwsDownloadError(
+            "Could not reach AWS.", hint="Check your network connection and try again."
+        ) from exc
+
+    storage_class = response.get("StorageClass") or "STANDARD"
+    state, expiry = _parse_restore_state(storage_class, response.get("Restore"))
+    return RemoteArchive(
+        bucket=bucket,
+        key=key,
+        region=region,
+        size_bytes=response.get("ContentLength", 0),
+        last_modified_utc=response["LastModified"],
+        storage_class=storage_class,
+        restore_state=state,
+        restore_expiry_utc=expiry,
+    )
+
+
+def restore_archive(
+    session: boto3.Session,
+    *,
+    bucket: str,
+    key: str,
+    region: str,
+    days: int,
+    tier: str,
+) -> str:
+    """Request a temporary restored copy. Returns ``requested`` or ``already_in_progress``."""
+    s3 = session.client("s3", region_name=region)
+    try:
+        s3.restore_object(
+            Bucket=bucket,
+            Key=key,
+            RestoreRequest={
+                "Days": days,
+                "GlacierJobParameters": {"Tier": cast("TierType", tier)},
+            },
+        )
+    except ClientError as exc:
+        if _error_code(exc) == "RestoreAlreadyInProgress":
+            return "already_in_progress"
+        message, hint = _download_failure(exc)
+        raise AwsDownloadError(message, hint=hint) from exc
+    return "requested"
+
+
+def download_file_with_progress(
+    session: boto3.Session,
+    *,
+    bucket: str,
+    key: str,
+    region: str,
+    path: Path,
+    on_bytes_transferred: Callable[[int], None],
+) -> None:
+    """Download ``key`` to ``path``, using ranged multipart transfer for large objects."""
+    s3 = session.client("s3", region_name=region)
+    transfer_config = TransferConfig(
+        multipart_threshold=_MULTIPART_THRESHOLD,
+        multipart_chunksize=_MULTIPART_CHUNKSIZE,
+        max_concurrency=4,
+        use_threads=True,
+    )
+    try:
+        s3.download_file(
+            Bucket=bucket,
+            Key=key,
+            Filename=str(path),
+            Config=transfer_config,
+            Callback=on_bytes_transferred,
+        )
+    except ClientError as exc:
+        message, hint = _download_failure(exc)
+        raise AwsDownloadError(message, hint=hint) from exc
+    except EndpointConnectionError as exc:
+        raise AwsDownloadError(
+            "Could not reach AWS during download.",
+            hint="Check your network connection and try again.",
+        ) from exc
+    except (BotoCoreError, OSError) as exc:
+        raise AwsDownloadError(f"Download failed: {key}", hint=str(exc)) from exc
+
+
+def download_bytes(
+    session: boto3.Session, *, bucket: str, key: str, region: str
+) -> bytes | None:
+    """Fetch a small companion object, returning ``None`` when it does not exist.
+
+    Used for the ``.sha256`` sidecar, whose absence is a reportable condition
+    rather than an error -- an archive uploaded by another tool may not have one.
+    """
+    s3 = session.client("s3", region_name=region)
+    try:
+        return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError as exc:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status == 404 or _error_code(exc) in ("404", "NoSuchKey"):
+            return None
+        message, hint = _download_failure(exc)
+        raise AwsDownloadError(message, hint=hint) from exc

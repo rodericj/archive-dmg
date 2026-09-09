@@ -49,3 +49,20 @@ def write_sha256_file(dmg_path: Path, hex_digest: str) -> Path:
     sha256_path = dmg_path.with_name(dmg_path.name + ".sha256")
     sha256_path.write_text(format_sha256_line(hex_digest, dmg_path.name))
     return sha256_path
+
+
+def parse_sha256_line(text: str) -> str | None:
+    """Extract the hex digest from a ``shasum``-style checksum file.
+
+    Returns ``None`` when the text does not contain a recognizable 64-character
+    hex digest, so callers can report "no usable checksum" rather than treating
+    a malformed companion file as a verification failure.
+    """
+    for line in text.splitlines():
+        candidate = line.strip().split(maxsplit=1)
+        if not candidate:
+            continue
+        digest = candidate[0].strip("*").lower()
+        if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return digest
+    return None

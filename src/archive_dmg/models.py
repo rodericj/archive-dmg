@@ -90,6 +90,84 @@ class RemoteVerificationResult:
     remote_checksum_verified: bool = False
 
 
+#: Storage classes whose objects must be restored before they can be read.
+#: ``GLACIER_IR`` is deliberately absent -- Instant Retrieval reads directly.
+ARCHIVED_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteArchive:
+    """One archived object in S3, as reported by ListObjectsV2 or HeadObject.
+
+    ``restore_state`` is one of:
+
+    ``not_applicable``
+        The object is in a directly readable storage class.
+    ``not_restored``
+        Archived, with no restore requested -- a download will fail.
+    ``in_progress``
+        A restore was requested and AWS has not finished it yet.
+    ``restored``
+        A temporary readable copy exists, expiring at ``restore_expiry_utc``.
+    """
+
+    bucket: str
+    key: str
+    region: str
+    size_bytes: int
+    last_modified_utc: datetime
+    storage_class: str
+    restore_state: str = "not_applicable"
+    restore_expiry_utc: datetime | None = None
+
+    @property
+    def uri(self) -> str:
+        return f"s3://{self.bucket}/{self.key}"
+
+    @property
+    def is_archived(self) -> bool:
+        """Whether this object's storage class requires a restore before reading."""
+        return self.storage_class in ARCHIVED_STORAGE_CLASSES
+
+    @property
+    def is_downloadable(self) -> bool:
+        """Whether a download would succeed right now."""
+        return not self.is_archived or self.restore_state == "restored"
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreRequestResult:
+    """Outcome of asking S3 for a temporary restored copy.
+
+    ``outcome`` is ``requested`` for a newly accepted request,
+    ``already_in_progress`` when one was already running, or
+    ``already_restored`` when a readable copy already exists.
+    """
+
+    archive: RemoteArchive
+    outcome: str
+    days: int
+    tier: str
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadVerification:
+    """Result of checking a downloaded file against its ``.sha256`` companion.
+
+    ``status`` is ``verified`` on a match, ``sidecar_missing`` when the object
+    had no ``.sha256`` companion in S3 to compare against, or ``skipped`` when
+    the caller opted out.
+    """
+
+    status: str
+    local_sha256: str | None = None
+    expected_sha256: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "verified"
+
+
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     """One row of ``doctor`` output."""
